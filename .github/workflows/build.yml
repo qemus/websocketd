@@ -1,0 +1,210 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version without the v prefix (leave empty to increment the latest upstream release)
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: websocketd-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout master
+        uses: actions/checkout@v7
+        with:
+          ref: master
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Determine release version
+        id: version
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION_OVERRIDE: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          upstream_tag="$(
+            gh api repos/joewalnes/websocketd/releases/latest \
+              --jq '.tag_name'
+          )"
+
+          if [[ -n "$VERSION_OVERRIDE" ]]; then
+            version="${VERSION_OVERRIDE#v}"
+          else
+            current="${upstream_tag#v}"
+
+            if [[ ! "$current" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+              echo "::error::Unsupported upstream version: $upstream_tag"
+              exit 1
+            fi
+
+            major="${BASH_REMATCH[1]}"
+            minor="${BASH_REMATCH[2]}"
+            patch="${BASH_REMATCH[3]}"
+
+            version="${major}.${minor}.$((10#$patch + 1))"
+          fi
+
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Invalid release version: $version"
+            exit 1
+          fi
+
+          {
+            echo "version=$version"
+            echo "tag=v$version"
+            echo "upstream_tag=$upstream_tag"
+            echo "release_name=$(date -u '+%B %-d, %Y')"
+            echo "sha=$(git rev-parse HEAD)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Test
+        run: go test ./...
+
+      - name: Install packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            gnupg \
+            rpm \
+            ruby-dev \
+            zip
+
+          sudo gem install --no-document fpm
+
+      - name: Build release assets
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          make -C release clean
+          make -C release RELEASE_VERSION="$VERSION" build
+
+      - name: Sign checksums
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+
+          directory="release/out/$VERSION"
+
+          if [[ -n "${GPG_PRIVATE_KEY:-}" ]]; then
+            printf '%s\n' "$GPG_PRIVATE_KEY" |
+              gpg --batch --import
+          else
+            gpg \
+              --batch \
+              --pinentry-mode loopback \
+              --passphrase '' \
+              --quick-generate-key \
+              "qemus websocketd CI release <actions@github.com>" \
+              rsa2048 \
+              sign \
+              0
+          fi
+
+          fingerprint="$(
+            gpg --batch --with-colons --list-secret-keys |
+              awk -F: '$1 == "fpr" { print $10; exit }'
+          )"
+
+          if [[ -z "$fingerprint" ]]; then
+            echo "::error::No GPG signing key is available"
+            exit 1
+          fi
+
+          gpg \
+            --batch \
+            --yes \
+            --pinentry-mode loopback \
+            --passphrase "${GPG_PASSPHRASE:-}" \
+            --local-user "$fingerprint" \
+            --output "$directory/CHECKSUMS.asc" \
+            --clearsign "$directory/CHECKSUMS"
+
+      - name: Verify release assets
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          directory="release/out/$VERSION"
+
+          platforms=(
+            darwin_amd64
+            freebsd_386
+            freebsd_amd64
+            linux_386
+            linux_amd64
+            linux_arm
+            linux_arm64
+            openbsd_386
+            openbsd_amd64
+            solaris_amd64
+            windows_386
+            windows_amd64
+          )
+
+          for platform in "${platforms[@]}"; do
+            test -f \
+              "$directory/websocketd-$VERSION-$platform.zip"
+          done
+
+          test -f "$directory/websocketd-${VERSION}_i386.deb"
+          test -f "$directory/websocketd-${VERSION}_amd64.deb"
+
+          test -f "$directory/websocketd.${VERSION}.i386.rpm"
+          test -f "$directory/websocketd.${VERSION}.x86_64.rpm"
+
+          test -f "$directory/CHECKSUMS"
+          test -f "$directory/CHECKSUMS.asc"
+
+          (
+            cd "$directory"
+            sha256sum --check CHECKSUMS
+          )
+
+      - name: Create release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          target_commitish: ${{ steps.version.outputs.sha }}
+          name: ${{ steps.version.outputs.release_name }}
+          body: |
+            Fork release built from `${{ github.repository }}@master`.
+
+            Upstream base release: `${{ steps.version.outputs.upstream_tag }}`.
+
+            `CHECKSUMS.asc` is signed with `GPG_PRIVATE_KEY` when that repository secret is configured. Otherwise, the workflow generates a temporary CI signing key so the asset set matches upstream.
+          files: |
+            release/out/${{ steps.version.outputs.version }}/CHECKSUMS
+            release/out/${{ steps.version.outputs.version }}/CHECKSUMS.asc
+            release/out/${{ steps.version.outputs.version }}/*.zip
+            release/out/${{ steps.version.outputs.version }}/*.deb
+            release/out/${{ steps.version.outputs.version }}/*.rpm
+          fail_on_unmatched_files: true
+          overwrite_files: true
+          preserve_order: true
+          make_latest: true
