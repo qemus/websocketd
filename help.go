@@ -42,18 +42,22 @@ Options:
                                  (no --port, --address, or --redirport), no
                                  TCP listener is started at all. A leftover
                                  socket file from an unclean shutdown at the
-                                 same path is removed automatically.
+                                 same path is removed automatically, but a
+                                 path another server is still listening on is
+                                 left alone and websocketd will not start.
                                  Default: "" (do not listen on a Unix socket)
 
   --sameorigin={true,false}      Restrict (HTTP 403) protocol upgrades if the
                                  Origin header does not match to requested HTTP
                                  Host. Default: false.
 
-  --origin=host[:port][,host[:port]...]
+  --origin=[scheme://]host[:port][,...]
                                  Restrict (HTTP 403) protocol upgrades if the
                                  Origin header does not match to one of the host
                                  and port combinations listed. If the port is not
-                                 specified, any port number will match.
+                                 specified, any port number will match. An entry
+                                 without a scheme matches BOTH http and https
+                                 origins; prefix "https://" to require TLS.
                                  Default: "" (allow any origin)
 
   --ssl                          Listen for HTTPS socket instead of HTTP.
@@ -102,7 +106,17 @@ Options:
                                  When maxforks reached the server will be
                                  rejecting requests that require executing
                                  another process (unlimited when 0 or negative).
-                                 Default: 0
+                                 Default: 1024, a runaway backstop rather than a
+                                 capacity plan. Raise it for high-concurrency
+                                 deployments, or set 0 for unlimited. Note it
+                                 gates only WS upgrades and CGI execs, not
+                                 static/redirect requests.
+
+  --maxframesize=bytes           Reject inbound WebSocket messages larger than
+                                 this, closing the connection (bounds per-client
+                                 memory use). Default: 1048576 (1 MiB). Set 0 to
+                                 disable the limit; raise it if clients legitimately
+                                 send larger frames.
 
   --closems=milliseconds         Specifies additional time process needs to gracefully
                                  finish before websocketd will send termination signals
@@ -145,7 +159,7 @@ Options:
                                  From most to least verbose:
                                  debug, trace, access, info, error, fatal
 
-Full documentation at http://websocketd.com/
+Full documentation at https://websocketd.com/
 
 Copyright 2013 Joe Walnes and the websocketd team. All rights reserved.
 BSD license: Run '{{binary}} --license' for details.

@@ -24,7 +24,7 @@ Download
 
 If you're on a Mac, you can install `websocketd` using [Homebrew](http://brew.sh/). Just run `brew install websocketd`. For other operating systems, or if you don't want to use Homebrew, check out the link below.
 
-**[Download for Linux, OS X and Windows](https://github.com/joewalnes/websocketd/wiki/Download-and-install)**
+**[Download for Linux, macOS and Windows](https://github.com/joewalnes/websocketd/wiki/Download-and-install)**
 
 
 Quickstart
@@ -106,7 +106,7 @@ More Features
 *   STDERR can optionally be forwarded to WebSocket clients (`--passstderr`), tagged alongside STDOUT as JSON so a client can tell the two apart.
 *   Command line help available via `websocketd --help`.
 *   Includes [WebSocket developer console](https://github.com/joewalnes/websocketd/wiki/Developer-console) to make it easy to test your scripts before you've built a JavaScript frontend.
-*   [Examples in many programming languages](https://github.com/joewalnes/websocketd/tree/master/examples) are available to help you getting started.
+*   [Examples in many programming languages](https://github.com/joewalnes/websocketd/tree/main/examples) are available to help you getting started.
 
 User Manual
 -----------

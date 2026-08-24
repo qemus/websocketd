@@ -16,6 +16,14 @@ go test ./...
 
 Unit tests are in `libwebsocketd/`. Integration tests are in `qa/integration/`. No linter is currently configured.
 
+The `qa/integration` tests build the `websocketd` binary from source in
+`TestMain`, but `go test` caches the result on that package's own inputs.
+Changing `libwebsocketd/`, `main.go`, or `config.go` does **not** invalidate
+the integration cache even though the built binary's behavior changes — a
+cached green can hide a real break. After changing any non-`qa/integration`
+package, re-run with `go test -count=1 ./...` (and `-race` for concurrency
+changes).
+
 ## Mistake retrospectives
 
 When you make a mistake (especially forgetting something the user asked for):
@@ -34,6 +42,12 @@ Update `README.md` (and any relevant docs) before committing if the change affec
 - Public API, CLI interface, or configuration
 - Setup/installation steps
 - Feature behavior visible to users
+
+The public website (websocketd.com) lives in `website/` on this branch and
+deploys via `.github/workflows/pages.yml`. It is not a separate branch, so
+check it alongside `README.md` for the same changes — the tutorial and feature
+list there go stale in exactly the same way. `website/CNAME` carries the custom
+domain and must not be deleted or renamed.
 
 ## Changelog
 

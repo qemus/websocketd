@@ -15,9 +15,16 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/joewalnes/websocketd/libwebsocketd"
 )
+
+// readHeaderTimeout bounds how long a client may take to send its request
+// headers before the handler runs. It applies only to the header read (not the
+// hijacked WebSocket stream or a long-running CGI/static response), so it is
+// safe on every server and defends against slowloris-style header dribbling.
+const readHeaderTimeout = 10 * time.Second
 
 func logfunc(l *libwebsocketd.LogScope, level libwebsocketd.LogLevel, levelName string, category string, msg string, args ...interface{}) {
 	if level < l.MinLevel {
@@ -47,12 +54,20 @@ func serve(network, address string, config *Config, log *libwebsocketd.LogScope)
 		return err
 	}
 	if !config.Ssl {
-		return http.Serve(listener, nil)
+		return (&http.Server{ReadHeaderTimeout: readHeaderTimeout}).Serve(listener)
 	}
 	if config.SslCaFile != "" {
 		return serveMutualTLS(listener, config.CertFile, config.KeyFile, config.SslCaFile, log)
 	}
-	return (&http.Server{}).ServeTLS(listener, config.CertFile, config.KeyFile)
+	server := &http.Server{ReadHeaderTimeout: readHeaderTimeout, TLSConfig: tlsConfig()}
+	return server.ServeTLS(listener, config.CertFile, config.KeyFile)
+}
+
+// tlsConfig returns the base TLS settings shared by all HTTPS servers. It pins
+// a minimum protocol version explicitly rather than relying on the Go default,
+// which has drifted across releases.
+func tlsConfig() *tls.Config {
+	return &tls.Config{MinVersion: tls.VersionTLS12}
 }
 
 // serveMutualTLS runs an HTTPS server on the given listener that requires
@@ -67,21 +82,39 @@ func serveMutualTLS(listener net.Listener, certFile, keyFile, caFile string, log
 		return fmt.Errorf("failed to parse CA certificates from %s", caFile)
 	}
 
+	cfg := tlsConfig()
+	cfg.ClientAuth = tls.RequireAndVerifyClientCert
+	cfg.ClientCAs = caCertPool
 	server := &http.Server{
-		TLSConfig: &tls.Config{
-			ClientAuth: tls.RequireAndVerifyClientCert,
-			ClientCAs:  caCertPool,
-		},
+		ReadHeaderTimeout: readHeaderTimeout,
+		TLSConfig:         cfg,
 	}
 	log.Info("server", "Mutual TLS enabled (client certs verified against %s)", caFile)
 	return server.ServeTLS(listener, certFile, keyFile)
 }
 
+// unixSocketProbeTimeout bounds the liveness probe against an existing socket
+// file. A local AF_UNIX connect either succeeds or is refused immediately; the
+// timeout only guards against a pathological listener that accepts nothing.
+const unixSocketProbeTimeout = time.Second
+
 // serveUnixSocket removes a stale socket file left behind by an unclean
 // shutdown (if any) and then serves on it. It only ever removes a path that
 // is actually a socket, never an arbitrary file that happens to be there.
+//
+// A socket file at the path may equally belong to a server that is still
+// running, so removing it unconditionally is not safe: unlinking a live
+// server's socket and binding a new one in its place leaves that process
+// running but permanently unreachable, with no error on either side. Probing
+// first tells the two apart — a successful dial means someone is listening, a
+// refused connection means the file is stale. Refusing to start on a live
+// socket matches what a TCP listener already does when its port is taken.
 func serveUnixSocket(path string, config *Config, log *libwebsocketd.LogScope) error {
 	if info, err := os.Stat(path); err == nil && info.Mode()&os.ModeSocket != 0 {
+		if conn, err := net.DialTimeout("unix", path, unixSocketProbeTimeout); err == nil {
+			conn.Close()
+			return fmt.Errorf("socket %s is already in use by a running server", path)
+		}
 		if err := os.Remove(path); err != nil {
 			return fmt.Errorf("failed to remove stale socket %s: %w", path, err)
 		}
@@ -93,6 +126,10 @@ func main() {
 	config := parseCommandLine()
 
 	log := libwebsocketd.RootLogScope(config.LogLevel, logfunc)
+
+	for _, o := range schemelessOriginWarnings(config.Ssl, config.AllowOrigins) {
+		log.Error("server", "--origin=%q has no scheme, so it also accepts insecure http origins; use \"https://%s\" to require TLS", o, o)
+	}
 
 	if config.DevConsole {
 		if config.StaticDir != "" {
@@ -150,22 +187,30 @@ func main() {
 			go func(addr string) {
 				pos := strings.IndexByte(addr, ':')
 				rediraddr := addr[:pos] + ":" + strconv.Itoa(config.RedirPort) // it would be silly to optimize this one
-				redir := &http.Server{Addr: rediraddr, Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					// redirect to same hostname as in request but different port and probably schema
-					uri := "https://"
-					if !config.Ssl {
-						uri = "http://"
-					}
-					if cpos := strings.IndexByte(r.Host, ':'); cpos > 0 {
-						uri += r.Host[:cpos] + addr[pos:] + "/"
-					} else {
-						uri += r.Host + addr[pos:] + "/"
-					}
+				redir := &http.Server{Addr: rediraddr,
+					// The redirect server only emits tiny immediate responses,
+					// so full timeouts are safe here (unlike the main server,
+					// which carries long-lived WebSocket/CGI streams).
+					ReadHeaderTimeout: readHeaderTimeout,
+					ReadTimeout:       10 * time.Second,
+					WriteTimeout:      10 * time.Second,
+					IdleTimeout:       60 * time.Second,
+					Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						// redirect to same hostname as in request but different port and probably schema
+						uri := "https://"
+						if !config.Ssl {
+							uri = "http://"
+						}
+						if cpos := strings.IndexByte(r.Host, ':'); cpos > 0 {
+							uri += r.Host[:cpos] + addr[pos:] + "/"
+						} else {
+							uri += r.Host + addr[pos:] + "/"
+						}
 
-					// Not an open redirect: the target is the host the client itself
-					// sent, switched to the canonical scheme and port.
-					http.Redirect(w, r, uri, http.StatusMovedPermanently) // #nosec G710
-				})}
+						// Not an open redirect: the target is the host the client itself
+						// sent, switched to the canonical scheme and port.
+						http.Redirect(w, r, uri, http.StatusMovedPermanently) // #nosec G710
+					})}
 				log.Info("server", "Starting redirect server   : http://%s/", rediraddr)
 				rejects <- redir.ListenAndServe()
 			}(addrSingle)

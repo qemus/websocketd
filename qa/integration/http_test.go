@@ -3,6 +3,7 @@ package integration
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -78,6 +79,46 @@ func TestHTTP003_StaticFilePathTraversal(t *testing.T) {
 	}
 }
 
+// TestHTTP003b_StaticSymlinkEscape verifies that a symlink inside the static
+// directory pointing outside it is not followed. Go's http.FileServer follows
+// such links by default, disclosing arbitrary file contents; websocketd wraps
+// the filesystem to refuse them. A symlink that stays inside the directory
+// must still resolve.
+func TestHTTP003b_StaticSymlinkEscape(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlinks require admin on Windows")
+	}
+	t.Parallel()
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "public.html"), []byte("PUBLIC"), 0644)
+
+	// A secret file outside the static directory, and a link to it inside.
+	secretDir := t.TempDir()
+	secret := filepath.Join(secretDir, "secret.txt")
+	os.WriteFile(secret, []byte("SECRET-CONTENTS"), 0644)
+	os.Symlink(secret, filepath.Join(dir, "leak"))
+
+	// A link that stays within the static directory.
+	os.Symlink(filepath.Join(dir, "public.html"), filepath.Join(dir, "inside-link.html"))
+
+	s := startServerOpts(t, []string{"--staticdir=" + dir}, "echo")
+
+	resp, body := s.HTTPGet("/leak")
+	if resp.StatusCode == 200 && strings.Contains(body, "SECRET-CONTENTS") {
+		t.Errorf("SECURITY: symlink escaping the static directory disclosed %q (status %d)", body, resp.StatusCode)
+	}
+
+	resp, body = s.HTTPGetFollow("/inside-link.html")
+	if resp.StatusCode != 200 || !strings.Contains(body, "PUBLIC") {
+		t.Errorf("symlink within the static directory should still resolve, got %d %q", resp.StatusCode, body)
+	}
+
+	resp, body = s.HTTPGetFollow("/public.html")
+	if resp.StatusCode != 200 || !strings.Contains(body, "PUBLIC") {
+		t.Errorf("normal static file should still resolve, got %d %q", resp.StatusCode, body)
+	}
+}
+
 func TestHTTP004_StaticAndWebSocketCoexist(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
@@ -108,6 +149,28 @@ func TestHTTP005_DevConsoleServing(t *testing.T) {
 	}
 	if !strings.Contains(body, "html") {
 		t.Error("dev console should return HTML")
+	}
+}
+
+// TestHTTP005b_DevConsoleXSS verifies the dev console HTML-escapes the
+// request-derived WebSocket address it echoes into the page. Go's net/http
+// surfaces a raw '"' in the request target verbatim in req.RequestURI, so an
+// unescaped substitution would break out of the value="..." attribute and
+// execute injected script. The request is sent raw because Go's HTTP client
+// (like curl) percent-encodes these characters before sending, hiding the bug.
+func TestHTTP005b_DevConsoleXSS(t *testing.T) {
+	t.Parallel()
+	s := startServerOpts(t, []string{"--devconsole"}, "echo")
+
+	resp := rawHTTPGet(t, s.Port, `/"><script>alert(1)</script>`)
+	body := readBody(t, resp)
+
+	if strings.Contains(body, `"><script>alert(1)</script>`) {
+		t.Errorf("SECURITY: dev console reflected an unescaped request path (XSS):\n%s", body)
+	}
+	// The escaped form should be present, proving the value was echoed but neutralized.
+	if !strings.Contains(body, "&lt;script&gt;") && !strings.Contains(body, "&#34;&gt;&lt;script") {
+		t.Errorf("expected the injected path to appear HTML-escaped, body:\n%s", body)
 	}
 }
 

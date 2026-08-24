@@ -8,6 +8,7 @@ package libwebsocketd
 import (
 	"errors"
 	"fmt"
+	"html"
 	"net"
 	"net/http"
 	"net/http/cgi"
@@ -163,9 +164,60 @@ func (h *WebsocketdServer) serveDevConsole(w http.ResponseWriter, req *http.Requ
 		return false
 	}
 	log.Access("http", "DEVCONSOLE")
-	content := strings.Replace(ConsoleContent, "{{addr}}", h.TellURL("ws", req.Host, req.RequestURI), -1)
+	// req.Host and req.RequestURI are attacker-controlled and echoed into
+	// the page inside a double-quoted HTML attribute. net/http surfaces a
+	// raw '"' in the request target verbatim, so escape before substituting
+	// to prevent the value from breaking out of the attribute (reflected XSS).
+	addr := html.EscapeString(h.TellURL("ws", req.Host, req.RequestURI))
+	content := strings.Replace(ConsoleContent, "{{addr}}", addr, -1)
 	http.ServeContent(w, req, ".html", h.Config.StartupTime, strings.NewReader(content))
 	return true
+}
+
+// resolveCgiPath maps a request URL path to a file inside cgiDir, refusing
+// any path that would escape the directory.
+//
+// req.URL.Path arrives already percent-decoded, and this handler is not
+// mounted behind a ServeMux that would normalize it, so "../" segments and
+// (on Windows) "..\" segments reach us verbatim. Naively joining such a
+// path lets a request name any file on the host, which cgi.Handler would
+// then execute — an unauthenticated RCE. We normalize the request path
+// ourselves and require the result to stay within cgiDir. checkPathBoundary
+// (applied by the caller) additionally defends against symlinks that point
+// out of the directory.
+func resolveCgiPath(cgiDir, urlPath string) (string, error) {
+	// Normalize in slash space, then map to the OS separator. path.Clean
+	// collapses "." and ".." lexically; a rooted clean path can never
+	// retain a leading "..", so anything that tried to climb out is folded
+	// back to the root and lands inside cgiDir.
+	clean := path.Clean("/" + filepath.ToSlash(urlPath))
+	if clean == "/" {
+		return "", fmt.Errorf("no CGI script named in path %q", urlPath)
+	}
+	filePath := filepath.Join(cgiDir, filepath.FromSlash(clean))
+
+	// Belt and suspenders: confirm the lexical result really is contained.
+	// The rooted clean above should already guarantee this on every OS
+	// (including Windows, where ToSlash folds "..\" into "../" before the
+	// clean sees it), so this check is not load-bearing today — it is here
+	// to fail closed if the normalization above is ever weakened.
+	if err := containsPath(cgiDir, filePath); err != nil {
+		return "", err
+	}
+	return filePath, nil
+}
+
+// containsPath reports an error unless child is dir itself or lies beneath it,
+// comparing lexically (no filesystem access, no symlink resolution).
+func containsPath(dir, child string) error {
+	rel, err := filepath.Rel(dir, child)
+	if err != nil {
+		return err
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("path %q escapes directory %q", child, dir)
+	}
+	return nil
 }
 
 // serveCGI executes CGI scripts from the configured directory. Returns true if handled.
@@ -173,9 +225,20 @@ func (h *WebsocketdServer) serveCGI(w http.ResponseWriter, req *http.Request, lo
 	if h.Config.CgiDir == "" {
 		return false
 	}
-	filePath := path.Join(h.Config.CgiDir, fmt.Sprintf(".%s", filepath.FromSlash(req.URL.Path)))
+	filePath, err := resolveCgiPath(h.Config.CgiDir, req.URL.Path)
+	if err != nil {
+		log.Access("http", "CGI: %s", err)
+		return false
+	}
 	fi, err := os.Stat(filePath)
 	if err != nil || fi.IsDir() {
+		return false
+	}
+
+	// Reject scripts reached through a symlink that leaves the CGI
+	// directory — the lexical check above cannot see those.
+	if err := checkPathBoundary(filePath, h.Config.CgiDir); err != nil {
+		log.Access("http", "CGI: %s", err)
 		return false
 	}
 
@@ -206,13 +269,41 @@ func (h *WebsocketdServer) serveCGI(w http.ResponseWriter, req *http.Request, lo
 	return true
 }
 
+// boundedDir is an http.FileSystem that serves files from a directory but
+// refuses any file reached through a symlink that leaves it. http.Dir alone
+// rejects ".." traversal but still follows symlinks out of the root, which
+// would disclose arbitrary file contents.
+type boundedDir struct {
+	root string
+	fs   http.FileSystem
+}
+
+func (d boundedDir) Open(name string) (http.File, error) {
+	// http.Dir cleans name, rejects "..", and returns proper os errors
+	// (so FileServer maps missing files to 404, not 500).
+	f, err := d.fs.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	// The file exists; confirm its real path is still within root before
+	// handing it back. filepath.Join(root, clean-name) mirrors how
+	// http.Dir maps the request to disk.
+	full := filepath.Join(d.root, filepath.FromSlash(path.Clean("/"+name)))
+	if err := checkPathBoundary(full, d.root); err != nil {
+		f.Close()
+		return nil, os.ErrNotExist
+	}
+	return f, nil
+}
+
 // serveStatic serves static files from the configured directory. Returns true if handled.
 func (h *WebsocketdServer) serveStatic(w http.ResponseWriter, req *http.Request, log *LogScope) bool {
 	if h.Config.StaticDir == "" {
 		return false
 	}
 	log.Access("http", "STATIC")
-	http.FileServer(http.Dir(h.Config.StaticDir)).ServeHTTP(w, req)
+	fs := boundedDir{root: h.Config.StaticDir, fs: http.Dir(h.Config.StaticDir)}
+	http.FileServer(fs).ServeHTTP(w, req)
 	return true
 }
 
