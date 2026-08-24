@@ -1,4 +1,4 @@
-name: Release
+name: Build
 
 on:
   workflow_dispatch:
@@ -11,7 +11,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  release:
+  build:
     runs-on: ubuntu-latest
 
     steps:
@@ -192,15 +192,11 @@ jobs:
 
           platforms=(
             darwin_amd64
-            freebsd_386
-            freebsd_amd64
+            darwin_arm64
             linux_386
             linux_amd64
             linux_arm
             linux_arm64
-            openbsd_386
-            openbsd_amd64
-            solaris_amd64
             windows_386
             windows_amd64
           )
