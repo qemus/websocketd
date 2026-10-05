@@ -61,7 +61,10 @@ func (pe *ProcessEndpoint) Terminate() {
 
 	pid := pe.process.cmd.Process.Pid
 
-	// Escalating termination: stdin close → SIGINT → SIGTERM → SIGKILL
+	// Escalating termination: stdin close → SIGINT → SIGTERM → SIGKILL.
+	// Signals go to the child's whole process group, and a final SIGKILL
+	// sweep (killLeftoverGroup) ensures nothing is left in it once the direct
+	// child is gone — previously grandchildren survived the session.
 	signals := []struct {
 		signal  os.Signal
 		name    string
@@ -75,19 +78,21 @@ func (pe *ProcessEndpoint) Terminate() {
 
 	for _, step := range signals {
 		if step.signal != nil {
-			if err := pe.process.cmd.Process.Signal(step.signal); err != nil {
+			if err := signalChild(pe.process.cmd.Process, step.signal); err != nil {
 				pe.log.Error("process", "%s unsuccessful to %v: %s", step.name, pid, err)
 			}
 		}
 		select {
 		case <-terminated:
 			pe.log.Debug("process", "Process %v terminated after %s", pid, step.name)
+			killLeftoverGroup(pid, pe.log)
 			return
 		case <-time.After(step.timeout):
 		}
 	}
 
 	pe.log.Error("process", "SIGKILL did not terminate %v!", pid)
+	killLeftoverGroup(pid, pe.log)
 }
 
 func (pe *ProcessEndpoint) Output() chan []byte {
@@ -111,16 +116,16 @@ func (pe *ProcessEndpoint) StartReading() {
 		// --passstderr at config-validation time, so only line-based
 		// reading is needed here.)
 		pe.wg.Add(2)
-		go pe.readStdoutTagged()
-		go pe.readStderrTagged()
+		go pe.relayStdout(func(line []byte) []byte { return tagMessage("stdout", line) }, pe.wg.Done)
+		go pe.relayStderr(true, pe.wg.Done)
 		go pe.closeOutputWhenDone()
 		return
 	}
-	go pe.logStderr()
+	go pe.relayStderr(false, nil)
 	if pe.bin {
 		go pe.readBinaryOutput()
 	} else {
-		go pe.readTextOutput()
+		go pe.relayStdout(func(line []byte) []byte { return line }, func() { close(pe.output) })
 	}
 }
 
@@ -129,8 +134,13 @@ func (pe *ProcessEndpoint) closeOutputWhenDone() {
 	close(pe.output)
 }
 
-func (pe *ProcessEndpoint) readTextOutput() {
-	defer close(pe.output)
+// relayStdout reads newline-terminated stdout output and delivers each line,
+// transformed by wrap, to the output channel. finish runs once the reader
+// exits, whether by EOF, a read error, or Terminate closing pe.done — it is
+// how the plain-text and --passstderr-tagged readers each signal their own
+// completion (closing pe.output directly, or joining pe.wg).
+func (pe *ProcessEndpoint) relayStdout(wrap func([]byte) []byte, finish func()) {
+	defer finish()
 	bufin := bufio.NewReader(pe.process.stdout)
 	for {
 		buf, err := bufin.ReadBytes('\n')
@@ -143,7 +153,7 @@ func (pe *ProcessEndpoint) readTextOutput() {
 			break
 		}
 		select {
-		case pe.output <- trimEOL(buf):
+		case pe.output <- wrap(trimEOL(buf)):
 		case <-pe.done:
 			return
 		}
@@ -152,7 +162,13 @@ func (pe *ProcessEndpoint) readTextOutput() {
 
 func (pe *ProcessEndpoint) readBinaryOutput() {
 	defer close(pe.output)
-	buf := make([]byte, 10*1024*1024)
+	// 64KB matches the largest chunk a pipe read can return (the kernel
+	// hands out at most the pipe capacity per read), so anything larger is
+	// virtual-memory pressure that can never be touched: 10MB x 1024 default
+	// --maxforks looked like 10GB of RSS while measuring ~300KB per connection
+	// (audit finding A10). Multi-chunk relaying is covered by
+	// TestCLI016_BinaryModeLargePayload.
+	buf := make([]byte, 64*1024)
 	for {
 		n, err := pe.process.stdout.Read(buf)
 		if err != nil {
@@ -185,63 +201,47 @@ func tagMessage(stream string, data []byte) []byte {
 	return msg
 }
 
-func (pe *ProcessEndpoint) readStdoutTagged() {
-	defer pe.wg.Done()
-	bufin := bufio.NewReader(pe.process.stdout)
-	for {
-		buf, err := bufin.ReadBytes('\n')
-		if err != nil {
-			if err != io.EOF {
-				pe.log.Error("process", "Unexpected error while reading STDOUT from process: %s", err)
-			} else {
-				pe.log.Debug("process", "Process STDOUT closed")
-			}
-			break
-		}
-		select {
-		case pe.output <- tagMessage("stdout", trimEOL(buf)):
-		case <-pe.done:
-			return
-		}
+// relayStderr drains stderr line by line into the log, streaming partial
+// chunks for lines longer than the reader's buffer (4KB): a stderr write
+// larger than that with no trailing newline would otherwise return
+// bufio.ErrBufferFull, and treating that as fatal abandoned the pipe — the
+// child then blocked forever on its next stderr write once the OS pipe
+// filled (a remote-triggered hang, since stdin is attacker-driven). Long
+// stderr lines are delivered (and logged) as consecutive partial chunks
+// instead.
+//
+// When tag is set (--passstderr) each chunk is also tagged and sent to the
+// output channel, in addition to being logged server-side same as without
+// the flag. finish, if non-nil, runs once the reader exits.
+func (pe *ProcessEndpoint) relayStderr(tag bool, finish func()) {
+	if finish != nil {
+		defer finish()
 	}
-}
-
-func (pe *ProcessEndpoint) readStderrTagged() {
-	defer pe.wg.Done()
 	bufstderr := bufio.NewReader(pe.process.stderr)
 	for {
 		buf, err := bufstderr.ReadSlice('\n')
+		if len(buf) > 0 {
+			line := trimEOL(buf)
+			pe.log.Error("stderr", "%s", string(line))
+			if tag {
+				select {
+				case pe.output <- tagMessage("stderr", line):
+				case <-pe.done:
+					return
+				}
+			}
+		}
+		if err == bufio.ErrBufferFull {
+			continue // partial chunk emitted above; keep draining
+		}
 		if err != nil {
 			if err != io.EOF {
 				pe.log.Error("process", "Unexpected error while reading STDERR from process: %s", err)
 			} else {
 				pe.log.Debug("process", "Process STDERR closed")
 			}
-			break
-		}
-		line := trimEOL(buf)
-		pe.log.Error("stderr", "%s", string(line)) // still logged server-side, same as without --passstderr
-		select {
-		case pe.output <- tagMessage("stderr", line):
-		case <-pe.done:
 			return
 		}
-	}
-}
-
-func (pe *ProcessEndpoint) logStderr() {
-	bufstderr := bufio.NewReader(pe.process.stderr)
-	for {
-		buf, err := bufstderr.ReadSlice('\n')
-		if err != nil {
-			if err != io.EOF {
-				pe.log.Error("process", "Unexpected error while reading STDERR from process: %s", err)
-			} else {
-				pe.log.Debug("process", "Process STDERR closed")
-			}
-			break
-		}
-		pe.log.Error("stderr", "%s", string(trimEOL(buf)))
 	}
 }
 

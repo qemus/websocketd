@@ -132,3 +132,35 @@ func TestGetRemoteInfo(t *testing.T) {
 		}
 	})
 }
+
+// TestGetURLInfoEmptyPathNoPanic verifies GetURLInfo returns an error, not a
+// panic, for out-of-spec request paths. The net/http ServeMux normally
+// guarantees a leading slash, but WebsocketdServer.ServeHTTP is an exported
+// http.Handler and can be embedded without one (audit finding A10).
+func TestGetURLInfoEmptyPathNoPanic(t *testing.T) {
+	config := &Config{UsingScriptDir: true, ScriptDir: t.TempDir()}
+	for _, path := range []string{"", "*", "x", "foo"} {
+		urlInfo, err := GetURLInfo(path, config)
+		if err == nil {
+			t.Errorf("GetURLInfo(%q) should have failed, got %+v", path, urlInfo)
+		}
+	}
+}
+
+// TestGenerateIdUnique verifies generateId's output: non-empty, and distinct
+// across calls. It used to be a raw UnixNano timestamp, which is guessable
+// and coarse-grained enough to collide under bursts; it is now crypto-random
+// (audit finding A10).
+func TestGenerateIdUnique(t *testing.T) {
+	seen := make(map[string]bool, 100)
+	for i := 0; i < 100; i++ {
+		id := generateId()
+		if id == "" {
+			t.Fatal("generateId returned an empty string")
+		}
+		if seen[id] {
+			t.Fatalf("generateId repeated %q on call %d", id, i)
+		}
+		seen[id] = true
+	}
+}

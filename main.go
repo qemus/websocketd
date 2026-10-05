@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"runtime"
 	"strconv"
@@ -26,6 +27,27 @@ import (
 // safe on every server and defends against slowloris-style header dribbling.
 const readHeaderTimeout = 10 * time.Second
 
+// escapeControls neutralizes control characters that have no business in a
+// log line: terminal escape sequences (ESC, OSC, BEL ...), embedded newlines
+// that would forge additional log lines, and DEL. Tab is kept (harmless
+// whitespace), and all other bytes — including UTF-8 — pass through
+// untouched. Child stderr is attacker-influenced when the wrapped program
+// echoes its input, and it is relayed into the log verbatim, so the log
+// function is the last place to keep such bytes out of the log stream.
+func escapeControls(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < 0x20 && c != '\t') || c == 0x7f {
+			fmt.Fprintf(&b, "\\x%02x", c)
+		} else {
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
+}
+
 func logfunc(l *libwebsocketd.LogScope, level libwebsocketd.LogLevel, levelName string, category string, msg string, args ...interface{}) {
 	if level < l.MinLevel {
 		return
@@ -37,11 +59,11 @@ func logfunc(l *libwebsocketd.LogScope, level libwebsocketd.LogLevel, levelName 
 		if index > 0 {
 			assocDump += " "
 		}
-		assocDump += fmt.Sprintf("%s:'%s'", pair.Key, pair.Value)
+		assocDump += fmt.Sprintf("%s:'%s'", pair.Key, escapeControls(pair.Value))
 	}
 
 	l.Mutex.Lock()
-	fmt.Printf("%s | %-6s | %-10s | %s | %s\n", libwebsocketd.Timestamp(), levelName, category, assocDump, fullMsg)
+	fmt.Printf("%s | %-6s | %-10s | %s | %s\n", libwebsocketd.Timestamp(), levelName, category, assocDump, escapeControls(fullMsg))
 	l.Mutex.Unlock()
 }
 
@@ -52,6 +74,15 @@ func serve(network, address string, config *Config, log *libwebsocketd.LogScope)
 	listener, err := net.Listen(network, address)
 	if err != nil {
 		return err
+	}
+	// Pin the Unix socket's permissions when asked: the umask default can
+	// leave the socket connectable by other local users. Chmod immediately
+	// after bind so the umask-derived window is as short as it can be.
+	if network == "unix" && config.SocketMode != 0 {
+		if err := os.Chmod(address, config.SocketMode); err != nil {
+			listener.Close()
+			return fmt.Errorf("failed to chmod unix socket %s to %o: %w", address, config.SocketMode, err)
+		}
 	}
 	if !config.Ssl {
 		return (&http.Server{ReadHeaderTimeout: readHeaderTimeout}).Serve(listener)
@@ -122,10 +153,131 @@ func serveUnixSocket(path string, config *Config, log *libwebsocketd.LogScope) e
 	return serve("unix", path, config, log)
 }
 
+// redirectAddress returns addr with its port replaced by redirPort. IPv6
+// literals must be split with net.SplitHostPort (which understands brackets);
+// splitting on the first colon lands inside "[::1]:port" and produced a
+// malformed listener address that failed to bind — and, being a listener
+// error, killed every other listener too.
+func redirectAddress(addr string, redirPort int) (string, error) {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "", fmt.Errorf("cannot derive redirect address from %q: %w", addr, err)
+	}
+	return net.JoinHostPort(host, strconv.Itoa(redirPort)), nil
+}
+
+// redirectLocation builds the redirect server's Location header: the host
+// the client itself sent, switched to the canonical scheme and the main
+// server's port. Not an open redirect: the target host is the client's own
+// Host header, only the port is rewritten.
+func redirectLocation(clientHost, listenAddr string, ssl bool) string {
+	scheme := "http"
+	if ssl {
+		scheme = "https"
+	}
+	host, _, err := net.SplitHostPort(clientHost)
+	if err != nil {
+		host = clientHost // no port in Host header — use it verbatim
+	}
+	_, port, err := net.SplitHostPort(listenAddr)
+	if err != nil {
+		return scheme + "://" + host + "/"
+	}
+	// A client Host that is already a bracketed IPv6 literal without a port
+	// must not be bracketed again by JoinHostPort.
+	if len(host) > 1 && host[0] == '[' && host[len(host)-1] == ']' {
+		return scheme + "://" + host + ":" + port + "/"
+	}
+	return scheme + "://" + net.JoinHostPort(host, port) + "/"
+}
+
+// redirectTarget builds the Location header the redirect server actually
+// sends for one request: redirectLocation's canonical origin, carrying the
+// path and query the client asked for. Without this a link into the site
+// (http://example.com/docs/page.html?q=1) redirected to the front page.
+//
+// Still not an open redirect. The origin is produced by redirectLocation and
+// nothing here can change it. The client-controlled bytes are never
+// concatenated onto that string; they travel as the Path/RawPath/RawQuery
+// fields of a reference URL that has no scheme and no host, and
+// URL.ResolveReference applies RFC 3986 resolution. A reference without an
+// authority cannot introduce one, so a path beginning "//" stays a path
+// rather than becoming a protocol-relative URL, and dot segments are removed
+// against the origin's root instead of climbing above it. URL.String() then
+// does the escaping: EscapedPath keeps the client's own percent-encoding
+// where it is a valid encoding of the decoded path and escapes what is not,
+// so nothing is double-encoded and an encoded "%2F" is not decoded into a
+// path separator.
+//
+// r.URL.Opaque and r.URL.Host are deliberately ignored. An absolute-form or
+// opaque request target ("GET http:foo") carries a host of its own, and
+// r.URL.RequestURI() would splice "http:foo" into the middle of the Location;
+// reading only Path and RawQuery degrades such a request to the bare origin.
+func redirectTarget(clientHost, listenAddr string, ssl bool, reqURL *url.URL) string {
+	origin := redirectLocation(clientHost, listenAddr, ssl)
+	if reqURL == nil {
+		return origin
+	}
+	base, err := url.Parse(origin)
+	if err != nil {
+		// redirectLocation built this string from a host it had already
+		// split; if it will not parse, the origin alone is the safe answer.
+		return origin
+	}
+	ref := &url.URL{
+		Path:       reqURL.Path,
+		RawPath:    reqURL.RawPath,
+		RawQuery:   reqURL.RawQuery,
+		ForceQuery: reqURL.ForceQuery,
+	}
+	return base.ResolveReference(ref).String()
+}
+
+// originPolicyWarning is printed at startup when no origin policy is
+// configured (audit finding A2: the default accepts any origin, so any web
+// page that can reach the server can drive the commands it serves). It is
+// printed directly to stderr, unconditionally of --loglevel, because it is
+// a security notice rather than a log line - the stdout log stream stays
+// clean for parsing, and daemons that redirect stdout to a log file still
+// show the warning on the console. --anyorigin, --sameorigin or --origin
+// silence it.
+const originPolicyWarning = `
+================================================================================
+  SECURITY WARNING: no origin policy is configured.
+================================================================================
+
+  This websocketd accepts WebSocket connections from ANY origin. Any web
+  page open in any browser that can reach this server can connect to every
+  command it serves: start processes, send them input, and read their
+  output. Browsers do not restrict cross-origin WebSocket connections -
+  restricting them is the server's job, and this server currently does not.
+
+  Your options:
+
+    --sameorigin               Only accept upgrades whose Origin matches the
+                               request Host (recommended for local and dev
+                               use).
+    --origin=host[:port][,...] Only accept upgrades from the listed origins,
+                               e.g. --origin=https://myapp.example.com
+    --anyorigin                Keep the current permissive behavior and
+                               silence this warning.
+
+  If you change nothing: any website you (or anyone using this machine) visit
+  while this server is running can drive the commands you are serving.
+
+  NOTE: a future version of websocketd will default to --sameorigin. If you
+  rely on the current behavior, pass --anyorigin explicitly to keep it.
+================================================================================
+`
+
 func main() {
 	config := parseCommandLine()
 
 	log := libwebsocketd.RootLogScope(config.LogLevel, logfunc)
+
+	if !config.SameOrigin && config.AllowOrigins == nil && !config.AnyOrigin {
+		fmt.Fprint(os.Stderr, originPolicyWarning)
+	}
 
 	for _, o := range schemelessOriginWarnings(config.Ssl, config.AllowOrigins) {
 		log.Error("server", "--origin=%q has no scheme, so it also accepts insecure http origins; use \"https://%s\" to require TLS", o, o)
@@ -185,8 +337,11 @@ func main() {
 
 		if config.RedirPort != 0 {
 			go func(addr string) {
-				pos := strings.IndexByte(addr, ':')
-				rediraddr := addr[:pos] + ":" + strconv.Itoa(config.RedirPort) // it would be silly to optimize this one
+				rediraddr, redirErr := redirectAddress(addr, config.RedirPort)
+				if redirErr != nil {
+					rejects <- redirErr
+					return
+				}
 				redir := &http.Server{Addr: rediraddr,
 					// The redirect server only emits tiny immediate responses,
 					// so full timeouts are safe here (unlike the main server,
@@ -196,20 +351,11 @@ func main() {
 					WriteTimeout:      10 * time.Second,
 					IdleTimeout:       60 * time.Second,
 					Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-						// redirect to same hostname as in request but different port and probably schema
-						uri := "https://"
-						if !config.Ssl {
-							uri = "http://"
-						}
-						if cpos := strings.IndexByte(r.Host, ':'); cpos > 0 {
-							uri += r.Host[:cpos] + addr[pos:] + "/"
-						} else {
-							uri += r.Host + addr[pos:] + "/"
-						}
-
 						// Not an open redirect: the target is the host the client itself
-						// sent, switched to the canonical scheme and port.
-						http.Redirect(w, r, uri, http.StatusMovedPermanently) // #nosec G710
+						// sent, switched to the canonical scheme and port, carrying the
+						// path and query it asked for. See redirectTarget for why the
+						// client-controlled bytes cannot move the authority.
+						http.Redirect(w, r, redirectTarget(r.Host, addr, config.Ssl, r.URL), http.StatusMovedPermanently) // #nosec G710
 					})}
 				log.Info("server", "Starting redirect server   : http://%s/", rediraddr)
 				rejects <- redir.ListenAndServe()

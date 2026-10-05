@@ -72,8 +72,11 @@ func createEnv(handler *WebsocketdHandler, req *http.Request, log *LogScope) []s
 	env = appendEnv(env, "REMOTE_PORT", handler.RemoteInfo.Port)
 	env = appendEnv(env, "REQUEST_URI", url.RequestURI()) // e.g. /foo/blah?a=b
 
-	// The following variables are part of the CGI specification, but are optional
-	// and not set by websocketd:
+	// The following variables are part of the CGI specification but carry no
+	// value here. The first five are not omitted: they are set above to the
+	// empty string, so nothing can reach the child from the parent
+	// environment under those names. A script sees them present and empty,
+	// not absent.
 	//
 	//   AUTH_TYPE, REMOTE_USER, REMOTE_IDENT
 	//     -- Authentication left to the underlying programs.
@@ -81,8 +84,8 @@ func createEnv(handler *WebsocketdHandler, req *http.Request, log *LogScope) []s
 	//   CONTENT_LENGTH, CONTENT_TYPE
 	//     -- makes no sense for WebSocket connections.
 	//
-	//   SSL_*
-	//     -- SSL variables are not supported, HTTPS=on added for websocketd running with --ssl
+	// SSL_* is the one group genuinely absent: SSL variables are not
+	// supported, and only HTTPS=on is added for websocketd running with --ssl.
 
 	if handler.server.Config.Ssl {
 		env = appendEnv(env, "HTTPS", "on")
@@ -99,6 +102,13 @@ func createEnv(handler *WebsocketdHandler, req *http.Request, log *LogScope) []s
 	}
 
 	for k, hdrs := range headers {
+		// Never propagate a client-supplied "Proxy" header as HTTP_PROXY:
+		// many HTTP clients honour that variable, so it would let a remote
+		// caller redirect the child's outbound traffic (httpoxy, CVE-2016-5385).
+		// net/http/cgi drops it for the same reason.
+		if http.CanonicalHeaderKey(k) == "Proxy" {
+			continue
+		}
 		header := fmt.Sprintf("HTTP_%s", dashReplacer.Replace(k))
 		env = appendEnv(env, header, hdrs...)
 		log.Debug("env", "Header variable %s", env[len(env)-1])

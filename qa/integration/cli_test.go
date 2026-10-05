@@ -1,6 +1,7 @@
 package integration
 
 import (
+	"fmt"
 	"net"
 	"net/http"
 	"os"
@@ -259,6 +260,94 @@ func TestCLI012_RedirPort(t *testing.T) {
 	}
 }
 
+// TestCLI014_RedirPortIPv6 verifies --redirport works with a bracketed IPv6
+// --address. The redirect listener's address used to be built by splitting on
+// the first colon, which lands inside "[::1]:port" — the malformed address
+// failed to bind, and because any listener error is fatal, the whole daemon
+// exited at startup. The Location header must also carry a properly
+// bracketed IPv6 literal.
+func TestCLI014_RedirPortIPv6(t *testing.T) {
+	t.Parallel()
+	probe, err := net.Listen("tcp", "[::1]:0")
+	if err != nil {
+		t.Skip("no IPv6 loopback available")
+	}
+	probe.Close()
+
+	mainPort := freePort(t)
+	redirPort := freePort(t)
+
+	cmd := exec.Command(websocketdBin,
+		"--port="+strconv.Itoa(mainPort),
+		"--address=[::1]",
+		"--redirport="+strconv.Itoa(redirPort),
+		"--loglevel=error",
+		testcmdBin, "echo")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("failed to start: %v", err)
+	}
+	t.Cleanup(func() {
+		cmd.Process.Kill()
+		cmd.Wait()
+	})
+
+	// Both listeners must come up on the IPv6 loopback. The pre-fix bug
+	// killed the process during startup, so these dials never succeed.
+	for _, port := range []int{mainPort, redirPort} {
+		deadline := time.Now().Add(10 * time.Second)
+		addr := fmt.Sprintf("[::1]:%d", port)
+		var ok bool
+		for time.Now().Before(deadline) {
+			if conn, err := net.DialTimeout("tcp", addr, 200*time.Millisecond); err == nil {
+				conn.Close()
+				ok = true
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		if !ok {
+			t.Fatalf("listener on %s never came up (daemon exited at startup?)", addr)
+		}
+	}
+
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	resp, err := client.Get(fmt.Sprintf("http://[::1]:%d/", redirPort))
+	if err != nil {
+		t.Fatalf("HTTP GET to redir port failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusMovedPermanently {
+		t.Errorf("expected 301, got %d", resp.StatusCode)
+	}
+	want := fmt.Sprintf("http://[::1]:%d/", mainPort)
+	if got := resp.Header.Get("Location"); got != want {
+		t.Errorf("redirect location = %q, want %q", got, want)
+	}
+}
+
+// TestCLI015_MaxFrameSizeNegativeRejected verifies that a negative
+// --maxframesize is rejected at startup. NewWebSocketEndpoint only applies
+// the read limit for positive values, so negatives used to silently mean
+// "unlimited" (issue #472).
+func TestCLI015_MaxFrameSizeNegativeRejected(t *testing.T) {
+	t.Parallel()
+	// Port 70000 is out of range, so even if the flag were (wrongly)
+	// accepted, the server exits on bind failure instead of serving forever.
+	_, stderr, code := runWebsocketd(t, "--port=70000", "--maxframesize=-1", testcmdBin, "echo")
+	if code == 0 {
+		t.Fatal("websocketd accepted --maxframesize=-1 and exited 0")
+	}
+	if !strings.Contains(stderr, "maxframesize") {
+		t.Errorf("expected an error naming maxframesize on stderr, got: %q", stderr)
+	}
+}
+
 func TestCLI013_Devconsole(t *testing.T) {
 	t.Parallel()
 	s := startServerOpts(t, []string{"--devconsole"}, "echo")
@@ -281,5 +370,43 @@ func TestCLI014_BinaryModeFlag(t *testing.T) {
 	_, recv := ws.RecvBinary()
 	if len(recv) != len(data) {
 		t.Errorf("binary echo: sent %d bytes, got %d", len(data), len(recv))
+	}
+}
+
+// TestCLI016_BinaryModeLargePayload covers multi-chunk binary relaying: a
+// 256KB payload must arrive byte-identical through the process's pipes. It
+// guards the binary reader's chunked relay path (pipe reads return at most
+// the pipe capacity per read), including after its buffer was right-sized
+// from 10MB to 64KB (audit finding A10) - chunk boundaries may differ, the
+// bytes may not.
+func TestCLI016_BinaryModeLargePayload(t *testing.T) {
+	t.Parallel()
+	s := startServerOpts(t, []string{"--binary"}, "binary-echo")
+	ws := s.Connect("/")
+	defer ws.Close()
+
+	payload := make([]byte, 256*1024)
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+	ws.SendBinary(payload)
+
+	got := make([]byte, 0, len(payload))
+	deadline := time.Now().Add(15 * time.Second)
+	for len(got) < len(payload) {
+		ws.conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		_, chunk, err := ws.conn.ReadMessage()
+		if err != nil {
+			t.Fatalf("receive failed after %d bytes: %v", len(got), err)
+		}
+		got = append(got, chunk...)
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out after %d of %d bytes", len(got), len(payload))
+		}
+	}
+	for i := range payload {
+		if got[i] != payload[i] {
+			t.Fatalf("payload diverged at byte %d: got %d, want %d", i, got[i], payload[i])
+		}
 	}
 }
